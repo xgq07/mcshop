@@ -1,0 +1,248 @@
+<?php
+
+
+namespace App\Http\Controllers\Wx;
+
+
+use App\CodeResponse;
+use App\Exceptions\BusinessException;
+use App\Models\User\User;
+use App\Services\User\UserServices;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Validator;
+use mysql_xdevapi\Exception;
+
+class  AuthController extends WxController
+{
+    protected $only = ['user','info','profile'];
+
+    public function user()
+    {
+        $user = Auth::guard('wx')->user();
+        return $user;
+    }
+
+    /**
+     * @return JsonResponse
+     * 用户信息
+     */
+    public function info()
+    {
+        /** @var User $user */
+        $user = Auth::guard('wx')->user();
+        return $this->success([
+            'nickName' => $user->nickname,
+            'avatar'   => $user->avatar,
+            'gender'   => $user->gender,
+            'mobile'   => $user->mobile
+        ]);
+    }
+
+    /**
+     * @return JsonResponse
+     * @throws BusinessException
+     * 修改个人信息
+     */
+    public function profile()
+    {
+        $nickname = $this->verifyString('nickname', null);
+
+        $avatar   = $this->verifyString('avatar', null);
+
+        $gender   = $this->verifyId('gender', null);
+
+        /** @var User $user */
+        $user = $this->user();
+        if (!empty($nickname)) {
+            $user->nickname = $nickname;
+        }
+
+        if (!empty($avatar)) {
+            $user->avatar = $avatar;
+        }
+
+        if (!empty($gender)) {
+            $user->gender = $gender;
+        }
+
+        return $user->save() ? $this->success() : $this->fail(CodeResponse::UPDATED_FAIL);
+
+    }
+
+    /**
+     * @return JsonResponse
+     * @throws BusinessException
+     * 重置密码
+     */
+    public function reset()
+    {
+
+        $mobile   = $this->verifyId('mobile');
+        $code     = $this->verifyId('code');
+        $password = $this->verifyString('password');
+
+        $isPass   = UserServices::getInstance()->checkCaptcha($mobile, $code);
+        if (!$isPass) {
+            return $this->fail(CodeResponse::AUTH_CAPTCHA_UNMATCH);
+        }
+
+        $user = UserServices::getInstance()->getByMobile($mobile);
+        if (is_null($user)) {
+            return $this->fail(CodeResponse::AUTH_MOBILE_UNREGISTERED);
+        }
+        $password       = Hash::make($password);
+        $user->password = $password;
+//        return $user->save() ? $this->success() : $this->fail(CodeResponse::UPDATED_FAIL);
+        return $this->failOrSuccess($user->save(),CodeResponse::UPDATED_FAIL);
+    }
+
+    public function logout()
+    {
+        Auth::guard('wx')->logout();
+        return $this->success();
+    }
+
+    /**
+     * @param  Request  $request
+     * @return JsonResponse
+     * @throws BusinessException
+     */
+    public function register(Request $request)
+    {
+        $username = $this->verifyString('username');
+        $password = $this->verifyId('password');
+        $mobile   = $this->verifyId('mobile');
+        $code     = $this->verifyId('code');
+
+        if (empty($username) || empty($password) || empty($mobile) || empty($code)) {
+            return $this->fail(CodeResponse::PARAM_ILLEGAL);
+        }
+
+        $user = UserServices::getInstance()->getByUsername($username);
+
+        if (!is_null($user)) {
+            return $this->fail(CodeResponse::AUTH_NAME_REGISTERED);
+        }
+
+        $validate = Validator::make(['mobile' => $mobile], ['mobile' => 'regex:/^1[0-9]{10}$']);
+
+        if ($validate->failed()) {
+            return $this->fail(CodeResponse::AUTH_INVALID_MOBILE);
+        }
+
+        $user = UserServices::getInstance()->getByMobile($mobile);
+
+        if (!is_null($user)) {
+            return $this->fail(CodeResponse::AUTH_MOBILE_REGISTERED);
+        }
+
+        $avatarUrl = "https://yanxuan.nosdn.127.net/80841d741d7fa3073e0ae27bf487339f.jpg?imageView&quality=90&thumbnail=64x64";
+
+//        if ()
+        //验证验证码
+        UserServices::getInstance()->checkCaptcha($mobile, $code);
+
+        $user                  = new User();
+        $user->username        = $username;
+        $user->password        = Hash::make($password);
+        $user->mobile          = $mobile;
+        $user->avatar          = $avatarUrl;
+        $user->nickname        = $username;
+        $user->last_login_time = Carbon::now()->toDateTimeString();
+        $user->last_login_ip   = $request->getClientIp();
+        $user->add_time        = Carbon::now()->toDateTimeString();
+        $user->update_time     = Carbon::now()->toDateTimeString();
+        $user->save();
+
+        $token = Auth::login($user);
+        //TODO 新用户发券
+        return $this->success([
+            'token'    => $token,
+            'userInfo' => [
+                'nickName'  => $username,
+                'avatarUrl' => $avatarUrl
+            ]
+        ]);
+
+    }
+
+    /**
+     * @param  Request  $request
+     * @return JsonResponse
+     * @throws \Exception
+     * 发送验证码
+     */
+    public function regCaptcha(Request $request)
+    {
+
+        $mobile = $this->verifyId('mobile');
+
+        $user = UserServices::getInstance()->getByMobile($mobile);
+
+        if (!is_null($user)) {
+            return $this->fail(CodeResponse::AUTH_MOBILE_REGISTERED);
+        }
+
+        $lock = Cache::add('register_captcha_lock_' . $mobile, 1, 60);
+
+        if (!$lock) {
+            return $this->fail(CodeResponse::AUTH_CAPTCHA_FREQUENCY);
+        }
+
+        $isPass = UserServices::getInstance()->checkMobileSendCaptchaCount($mobile, 10);
+
+        if (!$isPass) {
+            return $this->fail(CodeResponse::AUTH_CAPTCHA_FREQUENCY, '验证码每天发送不能超过10次');
+        }
+
+        $code = UserServices::getInstance()->setCaptcha($mobile);
+        UserServices::getInstance()->sendCaptchaMsg($mobile, $code);
+        return $this->success();
+    }
+
+    /**
+     * @param  Request  $request
+     * @return JsonResponse
+     * @throws BusinessException
+     * 登录接口
+     */
+    public function login(Request $request)
+    {
+        $username = $this->verifyString('username');
+        $password = $this->verifyId('password');
+
+        $user = UserServices::getInstance()->getByUsername($username);
+
+        if (is_null($user)) {
+            return $this->fail(CodeResponse::AUTH_INVALID_ACCOUNT);
+        }
+
+        $isPass = Hash::check($password, $user->getAuthPassword());
+
+        if (!$isPass) {
+            return $this->fail(CodeResponse::AUTH_INVALID_ACCOUNT, '账号和密码不正确');
+        }
+
+        $user->last_login_time = now()->toDateTimeString();
+        $user->last_login_ip   = $request->getClientIp();
+
+        if (!$user->save()) {
+            return $this->fail(CodeResponse::UPDATED_FAIL);
+        }
+
+        $token = Auth::login($user);
+
+        return $this->success([
+            'token'    => $token,
+            'userInfo' => [
+                'nickName'  => $username,
+                'avatarUrl' => $user->avatar
+            ]
+        ]);
+    }
+}
